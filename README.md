@@ -67,3 +67,6 @@ sambamba sort \
 --tmpdir $temp_dir/sambamba/${FILENAME}/ --out $temp_dir/mapped_pre_consensus/${FILENAME}.mapped_pre_consensus.bam \
 $temp_dir/mapped_pre_consensus/${FILENAME}.mapped_pre_consensus_unsorted.bam 2>>"$workingdir/logs/idt/1-align/${FILENAME}.err"
 ```
+
+Perform base quality score recalibration with gatk. 
+
