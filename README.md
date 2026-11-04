@@ -45,3 +45,25 @@ fgbio -Xmx16G --compression 0 --async-io FastqToBam \
 | sambamba sort -t 4 -m 16G --sort-picard -o $temp_dir/uBAM/${FILENAME}.unmapped.IDT.bam /dev/stdin
 ```
 
+Convert the uBAM back to fastq with picard SamToFastq to align with BWA-MEM2, then picard MergeBamAlignment to combine aligned reads with read information from the uBAM. Sort with sambamba. This is the first alignment, pre-consensus and pre-local realignment steps. 
+```
+picard -Xmx16G SamToFastq \
+--INPUT $temp_dir/uBAM/${FILENAME}.unmapped.IDT.bam \
+--VALIDATION_STRINGENCY SILENT --COMPRESSION_LEVEL 0 \
+--TMP_DIR $temp_dir/SamToFastq/${FILENAME}/ \
+--INTERLEAVE true --FASTQ /dev/stdout 2>"$workingdir/logs/${FILENAME}.err" \
+| bwa-mem2 mem -t 14 -K 120000000 -p -Y /path/to/reference/genome/hg38 - 2>>"$workingdir/logs/${FILENAME}.err" \
+| picard -Xmx16G MergeBamAlignment \
+--UNMAPPED $temp_dir/uBAM/${FILENAME}.unmapped.IDT.bam \
+--ALIGNED /dev/stdin \
+--OUTPUT $temp_dir/mapped_pre_consensus/${FILENAME}.mapped_pre_consensus_unsorted.bam \
+--REFERENCE_SEQUENCE /path/to/reference/hg38.fa
+--TMP_DIR $temp_dir/MergeBamAlignment/${FILENAME}/ \
+--SORT_ORDER unsorted --VALIDATION_STRINGENCY SILENT --CLIP_OVERLAPPING_READS false \
+--CLIP_ADAPTERS false --ALIGNER_PROPER_PAIR_FLAGS true --EXPECTED_ORIENTATIONS FR \
+--MAX_INSERTIONS_OR_DELETIONS -1 2>>"$workingdir/logs/${FILENAME}.err"
+
+sambamba sort \
+--tmpdir $temp_dir/sambamba/${FILENAME}/ --out $temp_dir/mapped_pre_consensus/${FILENAME}.mapped_pre_consensus.bam \
+$temp_dir/mapped_pre_consensus/${FILENAME}.mapped_pre_consensus_unsorted.bam 2>>"$workingdir/logs/idt/1-align/${FILENAME}.err"
+```
