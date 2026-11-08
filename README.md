@@ -22,10 +22,10 @@ Pkg.add(split("Printf Random StatsBase DelimitedFiles Statistics Distributions C
 7. Install ANNOVAR: https://annovar.openbioinformatics.org/en/latest/user-guide/download/
 8. Install VarDictJava, GRIDSS, and GRIPSS in your conda environment
 
-Note that in the code below, mkdir commands to create referenced folders are omitted for brevity.
+Note that in the code below, multiple steps to calculate quality metrics are interspersed through alignment steps, but have been omitted here for brevity.
 
 ## Alignment 
-Paired end sequencing fastq files were trimmed (adapters, poly-G, low quality 3' ends) with fastp. Create a temp directory to hold intermediate files. The FILENAME variable holds the name of your sample file name, which will stay constant throughout processing.
+Step 1: Paired end sequencing fastq files were trimmed (adapters, poly-G, low quality 3' ends) with fastp. Create a temp directory to hold intermediate files. The FILENAME variable holds the name of your sample file name, which will stay constant throughout processing.
 ```
 fastp \
 -i $fastqdir/${FILENAME}_1.fq.gz \ -I $fastqdir/${FILENAME}_2.fq.gz \
@@ -38,7 +38,7 @@ fastp \
 --thread 8
 ```
 
-uBAMs were constructed with fqbio and sorted with sambamba.
+Step 2: uBAMs were constructed with fqbio and sorted with sambamba.
 ```
 fgbio --compression 0 --async-io FastqToBam \
   --input $temp_dir/trimmed_fastq/${FILENAME}.trimmed_1.fq.gz $temp_dir/trimmed_fastq/${FILENAME}.trimmed_2.fq.gz \
@@ -47,7 +47,7 @@ fgbio --compression 0 --async-io FastqToBam \
 | sambamba sort -t 4 -m 16G --sort-picard -o $temp_dir/uBAM/${FILENAME}.unmapped.IDT.bam /dev/stdin
 ```
 
-Convert the uBAM back to fastq with picard SamToFastq to align with BWA-MEM2, then picard MergeBamAlignment to combine aligned reads with read information from the uBAM. Sort with sambamba. This is the first alignment, pre-consensus and pre-local realignment steps. 
+Step 3: Convert the uBAM back to fastq with picard SamToFastq to align with BWA-MEM2, then picard MergeBamAlignment to combine aligned reads with read information from the uBAM. Sort with sambamba. This is the first alignment, pre-consensus and pre-local realignment steps. 
 ```
 picard SamToFastq \
 --INPUT $temp_dir/uBAM/${FILENAME}.unmapped.IDT.bam \
@@ -70,7 +70,7 @@ sambamba sort \
 $temp_dir/mapped_pre_consensus/${FILENAME}.mapped_pre_consensus_unsorted.bam 2>>"$workingdir/logs/idt/1-align/${FILENAME}.err"
 ```
 
-Perform base quality score recalibration with GATK and index the recalibrated bam. The known-sites files are a part of the Broad Institute's resource bundle for GATK and can be downloaded here: https://gatk.broadinstitute.org/hc/en-us/articles/360035890811-Resource-bundle. 
+Step 4: Perform base quality score recalibration with GATK and index the recalibrated bam. The known-sites files are a part of the Broad Institute's resource bundle for GATK and can be downloaded here: https://gatk.broadinstitute.org/hc/en-us/articles/360035890811-Resource-bundle. 
 
 ```
 gatk BaseRecalibratorSpark \
@@ -93,7 +93,7 @@ gatk ApplyBQSR  \
 sambamba index $temp_dir/recal_table/${FILENAME}.recal.bam
 ```
 
-Perform local realignment with ABRA2 to improve accuracy of indel calling and indel VAF. Then sort, fix read mate information that ABRA2 may have rendered no longer correct, and group reads by position and UMI.
+Step 5: Perform local realignment with ABRA2 to improve accuracy of indel calling and indel VAF. Then sort, fix read mate information that ABRA2 may have rendered no longer correct, and group reads by position and UMI.
 ```
 abra2 \
 --in $temp_dir/recal_table/${FILENAME}.recal.bam \
@@ -116,7 +116,7 @@ $temp_dir/unmapped_consensus/${FILENAME}.abra2.bam \
 --family-size-histogram $temp_dir/seq_metrics/group_reads/${FILENAME}.consensus_metrics
 ```
 
-Collapse reads into duplex consensus families with fgbio, then sort. 
+Step 6: Collapse reads into duplex consensus families with fgbio, then sort. 
 ```
 fgbio --compression 0 CallDuplexConsensusReads \
 --input $temp_dir/unmapped_consensus/${FILENAME}.grouped.bam --output /dev/stdout \
@@ -125,12 +125,18 @@ fgbio --compression 0 CallDuplexConsensusReads \
 | sambamba sort \
 --tmpdir $temp_dir/sambamba/${FILENAME}/ --sort-picard \
 -o $temp_dir/unmapped_consensus/${FILENAME}.consensus.unmapped.bam /dev/stdin 
-
-fgbio CollectDuplexSeqMetrics \
---input $temp_dir/unmapped_consensus/${FILENAME}.grouped.bam \
---output $temp_dir/seq_metrics/consensus/${FILENAME}/${FILENAME}
 ```
-
+Step 7: Realign the consensus reads in the same way as in Step 3, and perform local realignment on the consensus mapped bams as in Step 5, with the addition of the following to filter consensus reads and remove some read tags to decrease storage size. Sort with sambamba afterwards. This is the final bam for downstream analyses. 
+```
+fgbio -Xmx16G --compression 0 FilterConsensusReads \
+--input /dev/stdin --output /dev/stdout \
+--ref /path/to/reference/hg38.fa  --min-reads 1 1 0 \
+--require-single-strand-agreement true --reverse-per-base-tags true \
+--max-read-error-rate 0.025 --min-base-quality 20 --max-no-calls 0.15 --max-base-error-rate 0.1 \
+| fgbio -Xmx16G RemoveSamTags \
+--input /dev/stdin --output $temp_dir/mapped_consensus/${FILENAME}.filtered.bam \
+--tags-to-remove ad bd ae be ac bc aq bq cd ce
+```
 
 
 
