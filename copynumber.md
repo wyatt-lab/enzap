@@ -22,10 +22,15 @@ copynum2 background /path/to/reference/probes_hg38.bed $(cat /path/to/reference/
 copynum2 background /path/to/reference/probes_hg38.bed $(cat /path/to/reference/cna_controls_wbc.txt) > path/to/reference/copynum_panel_background_wbc.jls
 ```
 
-Generate files containing logratio values across the probes, one file per sample, including for . Generate copy number plots for visualization of whole genome 
+Generate files containing logratio values across the probes, one file per sample, including for WBC samples.   
+Generate copy number plots for visualization of whole genome by switching the --output-format to "PDF" instead of "IGV". These will show genome-wide copy number profile as well as violin plots for coverage logratio over targeted genes.
 ```
-copynum2 call --report-dir=../../reports/copynum2_plots --output-format=PDF --features=../../reference/cn_features.bed --snps_dir=../../mutations/mutato_analyze/ --segment=0.2 --bad-snps=../../reference/hetz.blacklist ../../reference/panel_background.jls $(ls -1 | grep "cfDNA" ) &
+copynum2 call --report-dir=/project/logratio_tracks --output-format=IGV --features=/path/to/reference/cn_features.bed --snps_dir=/path/to/mutato_analyze/mut/files --segment=0.2 /path/to/reference/copynum_panel_background_cfdna.jls $(ls -1 | grep "cfDNA" ) &
+
+copynum2 call --report-dir=/project/logratio_tracks --output-format=IGV --features=/path/to/reference/cn_features.bed --snps_dir=/path/to/mutato_analyze/mut/files --segment=0.2 /path/to/reference/path/to/reference/copynum_panel_background_wbc.jls $(ls -1 | grep "WBC" ) &
 ```
+
+
 
 
 
