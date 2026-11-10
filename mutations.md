@@ -51,4 +51,5 @@ mutato_analyze_tools germline defects --min-germline-reads=50 > "mutato_analyze_
 '''
 The output is then further filtered and annotated as described in the publication, using custom python scripts.   
 
+The two sets of mutations from Vardict and R are intersected to identify mutations called by both, and those are manually curated (facilitated with IGV screenshots) to remove artefact and putative variants derived from clonal hematopoiesis.
 
