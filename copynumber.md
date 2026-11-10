@@ -16,13 +16,16 @@ chr1	26696115	26696235	ARID1A
 chr1	26696227	26696347	ARID1A
 ```
 
-Then, using copynum2 (included in the julia folder), create a copy number profile background file with the ctDNA-negative samples in the cohort. These are inputted as a list of sample names, one sample per row, in cna_controls.txt.  
+Then, using copynum2 (included in the julia folder), create a copy number profile background file with the ctDNA-negative samples in the cohort. These are inputted as a list of sample names, one sample per row, in cna_controls.txt. Repeat this with a subset of WBC samples that have no germline copy number alterations. 
 ```
-copynum2 background /path/to/reference/probes_hg38.bed $(cat /path/to/reference/cna_controls.txt) > path/to/reference/copynum_panel_background.jls
+copynum2 background /path/to/reference/probes_hg38.bed $(cat /path/to/reference/cna_controls_cfdna.txt) > path/to/reference/copynum_panel_background_cfdna.jls
+copynum2 background /path/to/reference/probes_hg38.bed $(cat /path/to/reference/cna_controls_wbc.txt) > path/to/reference/copynum_panel_background_wbc.jls
 ```
 
-Generate Generate copy number plots for visualization of whole genome 
-
+Generate files containing logratio values across the probes, one file per sample, including for . Generate copy number plots for visualization of whole genome 
+```
+copynum2 call --report-dir=../../reports/copynum2_plots --output-format=PDF --features=../../reference/cn_features.bed --snps_dir=../../mutations/mutato_analyze/ --segment=0.2 --bad-snps=../../reference/hetz.blacklist ../../reference/panel_background.jls $(ls -1 | grep "cfDNA" ) &
+```
 
 
 
