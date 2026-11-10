@@ -450,54 +450,5 @@ function translate_annovar_effect(gene, func, exonic_func, aa_change)
 	return (gene, join(effects, ". "))
 end
 
-function infer_cancer_fraction(sample_sheet::IO, mutation_table::IO; sex="")
-
-	d = read_tsv(sample_sheet)
-	cancer = [r"Cancer"i in t for t in d[:, "TYPE"]]
-	samples = d[cancer, "SAMPLE"]
-
-	d = read_tsv(mutation_table)
-	chr_col = findone(h -> r"^Chrom"i in h, d.headers)
-
-	if sex == ""
-		x_ploidy = NaN; y_ploidy = NaN;
-	elseif uppercase(sex) == "XY"
-		x_ploidy = 1; y_ploidy = 1;
-	elseif uppercase(sex) == "XX"
-		x_ploidy = 2; y_ploidy = 0;
-	else
-		error("--sex parameter must be XY, XX, or empty.")
-	end
-
-	cancer_frac = Dict(s => Float64(0) for s in samples)
-	for r in 1:size(d, 1)
-		sample = d[r, "Sample"]
-		if haskey(cancer_frac, sample) == false; continue; end
-		chr = d[r, chr_col]
-		ploidy = 2
-		if endswith(chr, 'X')
-			ploidy = x_ploidy
-		elseif endswith(chr, 'Y')
-			ploidy = y_ploidy
-		end
-		if isnan(ploidy); continue; end
-
-		m = match(r"% \((\d+) / (\d+)\)", d[r, "Mutant allele%"])
-		alt = parse(Int, m.captures[1]); total = parse(Int, m.captures[2])
-		maf = alt / total
-		# TODO: Skip amplified mutations.
-
-		cf = (ploidy == 1) ? maf : 2 / (1 / maf + 1)
-		if cancer_frac[sample] < cf; cancer_frac[sample] = cf; end
-	end
-
-	# Print estimated ctDNA fractions
-	for sample in sort(samples)
-		@printf("%s\t%.1f\n", sample, cancer_frac[sample] * 100)
-	end
-end
-
-
-
-subcommands(somatic, germline_defects, predict_effect, annotate, infer_cancer_fraction)
+subcommands(somatic, germline_defects, predict_effect, annotate)
 
