@@ -42,3 +42,13 @@ Patient-001	Patient-001_WBC	WBC
 Patient-002	EnzaP-002_cfDNA  Cancer background
 Patient-002	Patient-002_WBC	WBC
 ```
+
+The mutations can then be annotated with mutato_analyze_tools annotate, inputting GNOMAD, COSMIC, and ClinVar database files. The tool is included here in the julia folder.  
+Then, somatic and germline mutations are called separately.
+'''
+mutato_analyze_tools somatic --protein_altering=false --ox-filter=false --min-germline-reads=20 > "mutato_analuze_somatic_include_noncoding.tsv"
+mutato_analyze_tools germline defects --min-germline-reads=50 > "mutato_analyze_germline.tsv"
+'''
+The output is then further filtered and annotated as described in the publication, using custom python scripts.   
+
+
