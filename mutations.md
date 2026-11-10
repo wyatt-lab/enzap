@@ -26,3 +26,11 @@ Mutations that fall within the targeted regions (ie within targeted genes, not t
 5) Further filtered and processed with the code in scripts/vardict_somatic_filter.py. For our analyses, a minimum of 5 reads and 0.25% VAF was required, along with additional filters.
 
 ### Mutato Analyze
+Mutato analyze was run as below. The sample_sheet.tsv contains patient and sample IDs, along with annotation of sample type: "Cancer" for cfDNA samples and "WBC" for white blood cell controls. "background"  
+```
+mutato analyze --alt-reads=5 --alt-frac=0.0025 --min-mapq=45 \
+               --min-end-dist=15 --bg-ratio=20 --germline-ratio=3 \
+               --hotspots="${ref_matti}/mutation_hotspots.tsv" \
+               --output-dir="../mutations/mutato_analyze/" \
+               /path/to/reference/hg38.fa "/path/to/reference/sample_sheet.tsv"
+```
