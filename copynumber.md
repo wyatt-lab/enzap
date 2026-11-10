@@ -5,10 +5,11 @@ Copy number analyses included two distinct analyses.
 2) Focal intragenic copy number assessment. This analysis zooms into key genes with dense probe tiling (_TP53_, _RB1_, _PTEN_) and identifies focal, putatively deleterious/pathogenic copy number changes relative to the base ploidy identified in the genome-wide analysis above.  
 
 ## 1) Genome-wide copy number profiles 
-Coverage at probes across the genome were calculated with the sam count tool in Seqkit v 0.8.1 (https://github.com/annalam/seqkit). The probes_hg38.bed file is a tsv with 4 columns: chromosome, probe start genomic location, probe end genomic location, feature annotation (gene name or "SNP grid"). An example can be found below.   
+Coverage at probes across the genome were calculated with the sam count tool in Seqkit v 0.8.1 (https://github.com/annalam/seqkit). 
 ```
 sam count sample.bam /path/to/reference/probes_hg38.bed > /project/coverage/sample.tsv
 ```
+The probes_hg38.bed file is a tsv with 4 columns: chromosome, probe start genomic location, probe end genomic location, feature annotation (gene name or "SNP grid"). An example:
 ```
 chr1	26696003	26696123	ARID1A
 chr1	26696115	26696235	ARID1A
