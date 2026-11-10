@@ -15,9 +15,12 @@ chr1	26696115	26696235	ARID1A
 chr1	26696227	26696347	ARID1A
 ```
 
-Then, using copynum2 (included in the julia folder), create a 
+Then, using copynum2 (included in the julia folder), create a copy number profile background file with the ctDNA-negative samples in the cohort. These are inputted as a list of sample names, one sample per row, in cna_controls.txt.  
+```
+copynum2 background /path/to/reference/probes_hg38.bed $(cat /path/to/reference/cna_controls.txt) > path/to/reference/copynum_panel_background.jls
+```
 
-
+Generate Generate copy number plots for visualization of whole genome 
 
 
 
