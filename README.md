@@ -9,7 +9,7 @@ Our analysis software and scripts are written using the Julia and Rust programmi
 
 1. Install Julia version 1.8.5: [https://julialang.org/downloads/](https://julialang.org/downloads/oldreleases/)  
 2. Install the Rust compiler and toolchain: https://www.rust-lang.org/tools/install  
-3. Add the custom Julia modules in subfolder `julia_modules` included here to a folder on your system
+3. Add the custom Julia modules in subfolder `julia` included here to a folder on your system
 4. Add your folder to the LOAD_PATH, and install required Julia packages from inside the Julia terminal:
 
 ```
