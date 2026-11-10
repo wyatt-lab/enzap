@@ -1,0 +1,556 @@
+#!/bin/env julia
+
+using Helpers, Printf, CLI, Plot2, CopyNum, Subclones, Variant, StatsBase, Base, DelimitedFiles, PyPlot
+
+function load_vcf_samples(sample_predicate, vcf_path)
+	vcf = open(vcf_path)
+	headers = split(readline(vcf), '\t')
+	notes_col = findone(headers, "NOTES")
+
+	cols_to_keep = Int[]
+	append!(cols_to_keep, 1:notes_col)
+	for k in notes_col+1:length(headers)
+		if sample_predicate==headers[k]; push!(cols_to_keep, k); end
+	end
+	vcf = readdlm(vcf_path)
+	vcf = vcf[:, cols_to_keep]
+	open("temp_somatic_file.txt", "w") do io
+           writedlm(io, vcf)
+       	end
+	vcf = read_vcf("temp_somatic_file.txt")
+	return vcf[any(vcf.star, dims=2)[:], :] 
+end
+
+function autodetect_vcf_path(patient)
+	vcf_path = "-"
+	vcf_path_candidates = ["$(patient)_mutations.tsv", "$(patient)_somatic.vcf", "somatic.vcf", "../mutations/somatic.vcf", "../../mutations/somatic.vcf"]
+	for candidate in vcf_path_candidates
+		if isfile(candidate); vcf_path = candidate; break; end
+	end
+	return vcf_path
+end
+
+function truncal_model(patient::String; interactive=false, cancer_fraction=NaN, diploid_level=NaN,
+						adjust_depth=1, vcf_path="autodetect",
+						lr_median_decimate=1, hsaf_median_decimate=1,
+						q_threshold=NaN, lr_q_threshold=0.15, hsaf_q_threshold=0.15, 
+						separation_threshold=NaN, cn_separation_threshold=0.25, hsaf_separation_threshold=0.25,
+						kwargs...)
+
+	# Identify all patient samples that have already undergone segmentation
+	samples = [replace(f, "_segments.tsv", "") for f in readdir()
+		if startswith(f, patient) && endswith(f, "_segments.tsv")]
+	if length(samples) == 0; info("No samples with segmentation found"); return; end
+
+	if !isnan(cancer_fraction) && !isnan(diploid_level) && length(samples) > 1
+		error("Only one sample can be analysed if cancer_fraction and diploid_level are given")
+	end
+	if (!isnan(cancer_fraction) && isnan(diploid_level)) || (isnan(cancer_fraction) && !isnan(diploid_level))
+		error("Either both or neither of cancer_fraction and diploid_level can be given")
+	end
+
+	info("Using these samples in the analysis:")
+	for s in samples; info("- $s"); end
+
+	if r"auto[- ]?detect" in vcf_path
+		vcf_path = autodetect_vcf_path(patient)
+	end
+
+	if vcf_path != "-"
+		info("Reading mutations from $vcf_path")
+		vcf = load_vcf_samples(s -> s in samples, vcf_path)
+		snv = any(vcf.star, dims=2)[:] & (length.(vcf.ref_allele) .== 1) &
+			(length.(vcf.alt_allele) .== 1)
+		vcf = vcf[snv, :]
+		# TODO: Consider adjusting depth for mutations as well
+	else
+		m_tot_cn = zeros(0); m_maj_cn = zeros(0)
+		m_total_reads = zeros(0); m_alt_reads = zeros(0)
+		vcf = VCF()
+	end
+
+	out = open("$(patient)_populations.tsv", "w")
+	println(out, "Patient\tSample\tCancer%\tDiploid level\tClone")
+
+	for sample in samples
+		info("Analyzing sample $sample:")
+		segments = read_segments("$(sample)_segments.tsv", min_size=0, skip_xy=true)
+		filter!(seg -> isfinite(seg.depth), segments)
+		if isempty(segments)
+			info("NO VALID SEGMENTS FOUND\n")
+			return
+		else
+			info("- Read $(length(segments)) CN segments into memory.")
+		end
+
+		# If the heterozygous SNP allele fractions were originally calculated
+		# based on read counts (rather than DNA fragment counts), the binomial
+		# sampling model will be incorrect since paired end reads represent the
+		# same DNA fragment and are therefore not independent measurements.
+		# The user can provide an adjustment factor to convert reads counts
+		# into (approximate) fragment counts. For cfDNA fragments sequenced with
+		# 2 x 150 bp sequencing, the adjustment factor is 170 / (2 * 150) = 0.5667
+		for seg in segments; seg.depth *= adjust_depth; end
+
+		if isnan(cancer_fraction)
+			models = Subclones.find_truncal_model(segments; q_threshold=q_threshold, 
+				lr_q_threshold=lr_q_threshold, hsaf_q_threshold=hsaf_q_threshold, 
+				separation_threshold=separation_threshold, cn_separation_threshold=cn_separation_threshold, 
+				hsaf_separation_threshold=hsaf_separation_threshold, kwargs...)
+			if length(models)==0
+				println(stderr, "- No models found")
+				return
+			end
+			@printf(stderr, "- Best model: cancer %.2f%%, diploid level %.3f\n",
+					models[1].cancer_fraction * 100, models[1].diploid_level)
+		else
+			models = [(cancer_fraction=Float64(cancer_fraction), diploid_level=Float64(diploid_level))]
+		end
+		
+		# Work around for windows not being able to use bash commands for cut	
+		coverage_logratio = readdlm("$(sample)_logratio.igv")
+		coverage_logratio = coverage_logratio[:, [1,3,4]]
+		coverage_logratio[1,3] = "$(sample)"
+		open("temp_file_$(sample).txt", "w") do io
+           		writedlm(io, coverage_logratio)
+       		end
+		coverage_logratio = read_genome_track("temp_file_$(sample).txt", header=true)
+		coverage_logratio = median_decimate(coverage_logratio, lr_median_decimate)
+		
+		hetz_snp_fraction = readdlm("$(sample)_hetz_snp.tsv")
+		hetz_snp_fraction = hetz_snp_fraction[:, [1,2,3]]
+		open("temp_file_$(sample).txt", "w") do io
+           		writedlm(io, hetz_snp_fraction)
+       		end
+		hetz_snp_fraction = read_genome_track("temp_file_$(sample).txt", header=true)
+		hetz_snp_fraction = median_decimate(hetz_snp_fraction, hsaf_median_decimate)
+
+		rm("temp_file_$(sample).txt")
+		
+		vcf_col = findone(vcf.sample, sample)
+		if vcf_col == nothing
+			if vcf_path!="-"; info("WARNING: Cannot find sample $sample in VCF file."); end
+			m_total_reads = Int[]
+			m_alt_reads = Int[]
+		else
+			m_total_reads = vcf.total[:, vcf_col]
+			m_alt_reads = vcf.alt[:, vcf_col]
+		end
+
+		for candidate in 1:min(length(models), 2)
+			cancer_frac = models[candidate].cancer_fraction
+			diploid_level = models[candidate].diploid_level
+
+			function update_plot()
+				seg_tot_cn, seg_maj_cn = cn_states(cancer_frac, diploid_level, segments, max_cn=7; use_hsaf_table=true,
+					q_threshold=q_threshold, lr_q_threshold=lr_q_threshold, hsaf_q_threshold=hsaf_q_threshold, 
+					separation_threshold=separation_threshold, cn_separation_threshold=cn_separation_threshold, 
+					hsaf_separation_threshold=hsaf_separation_threshold)
+
+				# Calculate total region copy number and major allele copy number
+				# for each somatic mutation in this sample.
+				m_tot_cn, m_maj_cn = mut_segment_cn_states(vcf.chromosome,
+					vcf.position, segments, seg_tot_cn, seg_maj_cn)
+
+				int_cn = m_tot_cn .!= nothing  # Only show integer CN region muts
+
+				truncal_model_plot(cancer_frac, diploid_level, 
+					coverage_logratio, hetz_snp_fraction,
+					m_total_reads[int_cn], m_alt_reads[int_cn], m_tot_cn[int_cn], 
+					segments, seg_tot_cn, seg_maj_cn, adaptive_axis_limits=false,
+					lr_visualization_quantile=0.99)
+			end
+
+			if interactive
+				if candidate != 1; break; end
+				function arrow_key_press(event)
+					if event.key=="right"
+						diploid_level += 0.001
+					elseif event.key=="left"
+						diploid_level -= 0.001
+					elseif event.key=="up"
+						cancer_frac += 0.001
+					elseif event.key=="down"
+						cancer_frac -= 0.001
+					elseif event.key=="2"
+						cancer_frac, diploid_level = Subclones.convert_ploidy(4, 2, cancer_frac, diploid_level);
+					elseif event.key=="4"
+						cancer_frac, diploid_level = Subclones.convert_ploidy(2, 4, cancer_frac, diploid_level);
+					elseif event.key=="3"
+						cancer_frac, diploid_level = Subclones.convert_ploidy(6, 2, cancer_frac, diploid_level);
+					elseif event.key=="6"
+						cancer_frac, diploid_level = Subclones.convert_ploidy(2, 6, cancer_frac, diploid_level);
+					else; return; end
+					fig.clf(); update_plot()
+				end
+				start_drawing()
+				fig = plt.figure(figsize=(9,8))
+				fig."canvas"."mpl_connect"("key_press_event", arrow_key_press)
+				update_plot()
+				while (input = readline()) != ""
+					input = split(input, "=")
+					if length(input)==2
+						try
+							val = parse(Float64, input[2])
+							if lowercase(input[1])=="cf"
+									cancer_frac = val
+							elseif lowercase(input[1])=="dl"
+									diploid_level = val
+							end
+							update_plot()
+						catch
+							info("invalid command")
+						end
+					end
+					if input[1]=="0"
+						cancer_frac=0.0; diploid_level=0.0
+						break
+					end
+				end
+				close(fig)
+				stop_drawing()
+			end
+
+			if candidate==1
+				@printf(out, "%s\t%s\t%.5f\t%.3f\t1\n", patient, sample,
+						models[1].cancer_fraction, models[1].diploid_level)
+			end
+
+			suffix = candidate > 1 ? "_alt_model_$(candidate - 1)" : ""
+			Plot2.figure("$(sample)_truncal_model$(suffix).pdf", size=(9, 8)) do
+				update_plot()
+			end
+		end
+	end
+
+	close(out)
+end
+
+function cluster(patient::String; vcf_path="autodetect", dispersion=0.35)
+
+	d = readtsv("$(patient)_populations.tsv")
+	@assert d[1, 1:5] == ["Patient", "Sample", "Cancer%", "Diploid level", "Clone"]
+	d = d[2:end, :]
+
+	# The truncal clone always has clone ID = 1
+	d = d[(d[:, 1] .== patient) & (d[:, 5] .== 1), :]
+
+	# Read sample information into memory in lexical order
+	order = sortperm(d[:, 2])
+	samples = String.(d[order, 2])
+	cancer_fracs = Float64.(d[order, 3]) ./ 100
+	diploid_levels = Float64.(d[order, 4])
+	@assert allunique(samples)
+
+	info("Samples included in analysis:")
+	for s in samples; info("- $s"); end
+
+	if r"auto[- ]?detect" in vcf_path
+		vcf_path = autodetect_vcf_path(patient)
+		if vcf_path == ""
+			error("Please provide a mutation VCF file using --vcf-path=PATH.")
+		end
+	end
+
+	info("Reading mutations from $vcf_path")
+	vcf = load_vcf_samples(s -> s in samples, vcf_path)
+	vcf = vcf[:, sortperm(vcf.sample)]    # Sort VCF samples in lexical order
+	@assert vcf.sample == samples
+	
+	info("Reading sample CN segments into memory...")
+	m_tot_cn = fill(NaN, size(vcf, 1), length(samples))
+	m_maj_cn = fill(NaN, size(vcf, 1), length(samples))
+	for (s, sample) in enumerate(samples)
+		segments = read_segments("$(sample)_segments.tsv", min_size=0,
+			skip_xy=true)
+		filter!(seg -> isfinite(seg.depth), segments)
+		info("- $sample: $(length(segments)) segments")
+
+		seg_tot_cn, seg_maj_cn = cn_states(cancer_fracs[s], diploid_levels[s], segments, max_cn=7)
+		total_cn, major_cn = mut_segment_cn_states(vcf.chromosome,
+			vcf.position, segments, seg_tot_cn, seg_maj_cn)
+		m_tot_cn[:, s] = [x == nothing ? NaN : x for x in total_cn]
+		m_maj_cn[:, s] = [x == nothing ? NaN : x for x in major_cn]
+	end
+
+	info("Identifying mutations located in integer CN regions...")
+	int_cn = [all(isfinite, row) for row in eachrow(m_tot_cn)]
+	vcf = vcf[int_cn, :]
+	m_tot_cn = Int.(m_tot_cn[int_cn, :])
+	m_maj_cn = Int.(m_maj_cn[int_cn, :])
+
+	info("Clustering $(sum(int_cn)) mutations...")
+	clust_macn, mut_cluster = bayesian_clustering(cancer_fracs,
+		vcf.alt, vcf.total, m_tot_cn; dispersion_factor=dispersion, initial_clusters=500)
+	clust_macn = [cn > 1 ? round(cn) : cn for cn in clust_macn]
+	num_cluster_mutations = StatsBase.counts(mut_cluster, 1:size(clust_macn, 1))
+	@assert size(clust_macn, 2) == length(samples)
+	@assert all(isfinite.(clust_macn))
+
+	info("Determining final mutation cluster assignments...")
+	mut_cluster, _ = assign_mutation_clusters(cancer_fracs, clust_macn, num_cluster_mutations, vcf.alt, vcf.total, m_maj_cn, m_tot_cn)
+	@assert !any(mut_cluster .== 0)
+
+	info("Calculating cluster CCFs and merging...")
+	clust_ccf, combined = clust_macn_to_cf(clust_macn, combine_dist=0.13)
+	mut_ccf_cluster = zeros(Int, length(mut_cluster))
+	for (i, merged) in enumerate(combined)
+		mut_ccf_cluster[[c in merged for c in mut_cluster]] .= i
+	end
+	@assert !any(mut_ccf_cluster .== 0)
+
+	info("Solving the phylogenetic tree...")
+	phylogenies = Subclones.solve_phylogeny(clust_ccf)
+	if isempty(phylogenies)
+		info("WARNING: No valid phylogenetic trees found.")
+	elseif length(phylogenies) > 1
+		info("WARNING: Found $(length(phylogenies)) possible phylogenetic trees.")
+	end
+
+	info("Updating $(patient)_populations.tsv with subclone data...")
+	out = open("$(patient)_populations.tsv", "w")
+	print(out, "Patient\tSample\tCancer%\tDiploid level\tClone\tN-Mutations\tCCF")
+	if length(phylogenies) == 1
+		print(out, "\tParent")
+	else
+		# If we have multiple valid phylogenetic trees, include them all in
+		# separate "Parent (tree X)" columns.
+		for p in 1:length(phylogenies); print(out, "\tParent (tree $p)"); end
+	end
+	print(out, "\n")
+
+	for s in 1:length(samples), c in 1:size(clust_ccf, 1)
+		@printf(out, "%s\t%s\t%.2f\t%.3f\t%d\t%d\t%.4f", patient, samples[s],
+			cancer_fracs[s] * 100, diploid_levels[s], c, sum(mut_ccf_cluster.==c), clust_ccf[c, s])
+		for p in 1:length(phylogenies)
+			sc_parents, sc_fracs = phylogenies[p]
+			print(out, "\t$(sc_parents[c])")
+		end
+		print(out, "\n")
+	end
+	close(out)
+
+	info("Rendering MAF, MACN and CCF scatterplots...")
+	maf = vcf.alt ./ vcf.total
+	mut_macn = fill(NaN, size(maf))
+	for m in 1:size(maf, 1), s in 1:size(maf, 2)
+		mut_macn[m, s] = vcf.alt[m, s] / vcf.total[m, s] /
+			expected_maf(cancer_fracs[s], 1, m_tot_cn[m, s], 2)
+	end
+	mut_ccf = mut_macn ./ max.(1, ceil.(Int, clust_macn[mut_cluster, :]))
+	@assert all(isfinite.(mut_macn))
+
+	sample_pairs = [(a, b) for a in 1:length(samples)-1 for b in a+1:length(samples)]
+	scatter_rspan = 4; hist_rspan = 3
+	bar_rspan = max(1, round(Int, size(clust_ccf, 1) / 3))
+	gridrows = scatter_rspan * length(sample_pairs) + (hist_rspan + bar_rspan) * ceil(Int, length(samples)/3)
+	Plot2.figure("$(patient)_subclones.pdf", size=(10, gridrows*0.75)) do	
+		color(k) = k <= length(GROUP_PALETTE) ? GROUP_PALETTE[k] : RGB(0)
+
+		for (sp, sample_pair) in enumerate(sample_pairs)
+			a, b = sample_pair
+			plot_row = 1+(sp-1)*scatter_rspan
+
+			# MAF scatter plot, colored by region total CN
+			subplot((plot_row, 1), rows=gridrows, cols=3, rowspan=scatter_rspan)
+			maf_color = [all(cn .== cn[1]) ? CN_PALETTE[cn[1]] : RGB(230)
+				for cn in eachrow(m_tot_cn[:, [a, b]])]  # Color by CN if equal
+			scatter_plot(maf[:, a], maf[:, b], color=maf_color)
+			title("MAF"); xlabel(samples[a]); ylabel(samples[b])
+			
+			# MACN scatter plot, colored by cluster assignment
+			subplot((plot_row, 2), rows=gridrows, cols=3, rowspan=scatter_rspan)
+			scatter_plot(mut_macn[:, a], mut_macn[:, b], color=color.(mut_cluster))
+			title("MACN"); xlabel(samples[a]); ylabel(samples[b])
+
+			# CCF scatter plot, colored by cluster assignment
+			subplot((plot_row, 3), rows=gridrows, cols=3, rowspan=scatter_rspan)
+			scatter_plot(mut_ccf[:, a], mut_ccf[:, b], color=color.(mut_ccf_cluster))
+			title("CCF"); xlabel(samples[a]); ylabel(samples[b])
+		end
+
+		hist_row = 1 + length(sample_pairs) * scatter_rspan
+		cols = length(samples)==2 ? 6 : 3
+		colspan = length(samples)<3 ? 3 : 1
+		for s in 1:length(samples)
+			col = 1+(s-1)%cols
+			if length(samples)==2 && s==2; col = 4; end
+
+			# Cluster CCF histogram
+			subplot((hist_row, col), rows=gridrows, cols=cols, rowspan=hist_rspan, colspan=colspan)
+			for (i,cluster) in enumerate(sort(unique(mut_ccf_cluster)))
+				histogram_plot(mut_ccf[mut_ccf_cluster.==cluster, s], bwidth=0.03, 
+								color=color(cluster), height=1, ybottom=i-1)
+			end
+			# CCF detection thresholds for different copy numbers
+			ymax = get_ylim(2)
+			cns = findall(counts(m_tot_cn[:,s], 1:6) .> size(m_tot_cn,1)*0.01)
+			for cn in cns
+				thresh = mutant_allele_cn(0.1, cancer_fracs[s], cn, 2)
+				line_plot(fill(thresh, 2), [0, ymax], line_width=1, style="dashed")
+				text(thresh, ymax, cn, v_align="bottom")
+			end
+			xmax = 2.0
+			grid(false)
+			xlabel("CCF - $(samples[s])")
+			xlim(0, xmax); ylim(0,NaN)
+			yticks([], spine=false)
+
+			# Cluster mean barplots under histograms
+			subplot((hist_row+hist_rspan, col), rows=gridrows, cols=cols, rowspan=bar_rspan, colspan=colspan)
+			PyPlot.barh(1:size(clust_ccf, 1), clust_ccf[:,s], color=hex(color.(1:size(clust_ccf,1))))
+			xticks([], spine=false); yticks([], spine=false)
+			xlim(0, xmax)
+		end
+	end
+
+	# sample_pairs = [(a, b) for a in 1:length(samples)-1
+	# 		for b in a+1:length(samples)]
+	# Plot2.figure("$(patient)_subclones.pdf", size=(10, 3.2 * length(sample_pairs))) do	
+	# 	for (plot_row, sample_pair) in enumerate(sample_pairs)
+	# 		a, b = sample_pair
+
+	# 		# MAF scatter plot, colored by region total CN
+	# 		subplot((plot_row, 1), rows=length(sample_pairs), cols=3)
+	# 		maf_color = [all(cn .== cn[1]) ? CN_PALETTE[cn[1]] : RGB(230)
+	# 			for cn in eachrow(m_tot_cn[:, [a, b]])]  # Color by CN if equal
+	# 		scatter_plot(maf[:, a], maf[:, b], color=maf_color)
+	# 		title("MAF"); xlabel(samples[a]); ylabel(samples[b])
+			
+	# 		# MACN scatter plot, colored by cluster assignment
+	# 		subplot((plot_row, 2), rows=length(sample_pairs), cols=3)
+	# 		scatter_plot(mut_macn[:, a], mut_macn[:, b], color=GROUP_PALETTE[mut_cluster])
+	# 		title("MACN"); xlabel(samples[a]); ylabel(samples[b])
+
+	# 		# CCF scatter plot, colored by cluster assignment
+	# 		subplot((plot_row, 3), rows=length(sample_pairs), cols=3)
+	# 		scatter_plot(mut_ccf[:, a], mut_ccf[:, b], color=GROUP_PALETTE[mut_ccf_cluster])
+	# 		title("CCF"); xlabel(samples[a]); ylabel(samples[b])
+	# 	end
+	# end
+end
+
+
+
+function copy_number_deconvolution(patient::String)
+
+	d = readtsv("$(patient)_populations.tsv")
+	correct_headers = split("Patient\tSample\tCancer%\tDiploid level\tClone\tN-Mutations\tCCF\tParent", '\t')
+	if size(d, 2) < 8 || d[1, 1:8] != correct_headers
+		error("$(patient)_populations.tsv header must contain:\n$(join(correct_headers, '\t'))")
+	end
+	d = d[2:end, :]
+
+	samples = sort(unique(String.(d[:, 2])))
+	cancer_fracs = map(samples) do sample
+		only(unique(Float64.(d[d[:, 2] .== sample, 3]))) / 100
+	end
+	diploid_levels = map(samples) do sample
+		only(unique(Float64.(d[d[:, 2] .== sample, 4])))
+	end
+	subclones = sort(unique(Int.(d[:, 5])))
+	ccfs = [d[findone(r -> d[r, 2] == sample && d[r, 5] == clone, 1:size(d, 1)), 7]
+		for clone in subclones, sample in samples]
+	phylo_parents = map(subclones) do clone
+		only(unique(Int.(d[d[:, 5] .== clone, 8])))
+	end
+
+	info("Using these samples in the analysis:")
+	for s in samples; info("- $s"); end
+
+	info("Reading sample CN segments into memory...")
+	segments = hcat([read_segments("$(sample)_segments.tsv", min_size=5e6,
+			skip_xy=true) for sample in samples]...)
+
+	info("Calculating subclone fractions excluding nested subclones...")
+	excl_ccfs = copy(ccfs)
+	for s in 1:length(samples)
+		for c in 1:length(subclones)
+			nested = sum(ccfs[phylo_parents .== subclones[c], s])
+			excl_ccfs[c, s] -= nested
+		end
+	end
+
+	info("Performing subclonal copy number deconvolution...")
+	sc_total_cns, sc_alt_cns, _ = cn_deconvolution(cancer_fracs, diploid_levels, segments, excl_ccfs, phylo_parents; max_cn=8)
+
+	info("Reading coverage logratios into memory...")
+	coverage_logratios = map(samples) do sample
+		lr = read_genome_track(`cmd /k cut -f 1,3,5 $(sample)_logratio.igv`, header=true)
+		return median_decimate(lr, 400)
+	end
+
+	info("Reading heterozygous SNP allele fractions into memory...")
+	hsafs = map(samples) do sample
+		hsaf = read_genome_track(`cmd /k cut -f 1,2,3 $(sample)_hetz_snp.tsv`, header=true)
+		return median_decimate(hsaf, 10)
+	end
+
+	Plot2.figure("$(patient)_cn_deconvolution.pdf", size=(10, 3 * (length(samples) + length(subclones)))) do
+		cn_deconvolution_plot(cancer_fracs, diploid_levels, coverage_logratios, hsafs, segments, excl_ccfs, phylo_parents, sc_total_cns, sc_alt_cns, sample_names=samples)
+	end
+end
+
+
+# This subcommand can be used to recalculate a phylogenetic tree based on a
+# *_populations.tsv file where the population CCF values have been manually
+# adjusted.
+function solve_phylogeny(patient::String)
+
+	d = readtsv("$(patient)_populations.tsv")
+	@assert d[1, 1:7] == ["Patient", "Sample", "Cancer%", "Diploid level", "Clone", "N-Mutations", "CCF"]
+	d = d[2:end, :]
+
+	@assert(all(d[:, 1] .== patient))
+
+	# Read sample information into memory in lexical order
+	truncal = findall(d[:, 5] .== 1)
+	samples = String.(d[truncal, 2])
+	cancer_fracs = Float64.(d[truncal, 3]) ./ 100
+	diploid_levels = Float64.(d[truncal, 4])
+	P = maximum(d[:, 5])     # Number of populations
+	@assert allunique(samples)
+	@assert sort(unique(d[:, 5])) == collect(1:P)
+
+	clust_ccf = fill(NaN, P, length(samples))
+	for p in 1:P, s in 1:length(samples)
+		clust_ccf[p, s] = only([r[7] for r in eachrow(d)
+			if r[2] == samples[s] && r[5] == p])
+	end
+
+	clust_n_muts = d[d[:,2].==samples[1], 6]
+
+	info("Solving the phylogenetic tree...")
+	phylogenies = Subclones.solve_phylogeny(clust_ccf)
+	if isempty(phylogenies)
+		info("WARNING: No valid phylogenetic trees found.")
+	elseif length(phylogenies) > 1
+		info("WARNING: Found $(length(phylogenies)) possible phylogenetic trees.")
+	end
+
+	info("Updating $(patient)_populations.tsv with subclone data...")
+	out = open("$(patient)_populations2.tsv", "w")
+	print(out, "Patient\tSample\tCancer%\tDiploid level\tClone\tN-Mutations\tCCF")
+	if length(phylogenies) == 1
+		print(out, "\tParent")
+	else
+		# If we have multiple valid phylogenetic trees, include them all in
+		# separate "Parent (tree X)" columns.
+		for p in 1:length(phylogenies); print(out, "\tParent (tree $p)"); end
+	end
+	print(out, "\n")
+
+	for s in 1:length(samples), c in 1:size(clust_ccf, 1)
+		@printf(out, "%s\t%s\t%.2f\t%.3f\t%d\t%d\t%.4f", patient, samples[s],
+			cancer_fracs[s] * 100, diploid_levels[s], c, clust_n_muts[c], clust_ccf[c, s])
+		for p in 1:length(phylogenies)
+			sc_parents, sc_fracs = phylogenies[p]
+			print(out, "\t$(sc_parents[c])")
+		end
+		print(out, "\n")
+	end
+	close(out)
+end
+
+subcommands(truncal_model, cluster, copy_number_deconvolution,
+	solve_phylogeny)
