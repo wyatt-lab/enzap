@@ -36,8 +36,14 @@ An example line in the cn_features.bed file (do not include headers in file):
 chr1	26696003	26780786	ARID1A
 ```
 
-Then, in julia, run the tool for copy number model fitting from the /project/logratio_tracks folder. 
+Then, in the julia REPL, run subclones_windows for copy number model fitting from the /project/logratio_tracks folder. 
+```
+include("/path/to/tools/subclones_windows")
+truncal_model("sample_name", interactive=true, adjust_depth=0.567, vcf_path="-")
+```
+An interactive window will load, with genome-wide probs and lines indicating ploidy levels. The pre-calculated ctDNA% and diploid line can be adjusted until the model best fits the observed data.
 
+2) Focal copy number analyses
 
 
 
