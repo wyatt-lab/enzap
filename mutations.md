@@ -26,11 +26,19 @@ Mutations that fall within the targeted regions (ie within targeted genes, not t
 5) Further filtered and processed with the code in scripts/vardict_somatic_filter.py. For our analyses, a minimum of 5 reads and 0.25% VAF was required, along with additional filters.
 
 ### Mutato Analyze
-Mutato analyze was run as below. The sample_sheet.tsv contains patient and sample IDs, along with annotation of sample type: "Cancer" for cfDNA samples and "WBC" for white blood cell controls. "background"  
+Mutato analyze was run as below. The sample_sheet.tsv contains patient and sample IDs, along with annotation of sample type: "Cancer" for cfDNA samples and "WBC" for white blood cell controls. The additional presence of the string "background" (case-insensitive) marks samples to be used as control samples to calculate cohort-wide background error for each mutation called. In the ENZA-p analyses, the set of controls were 21 ENZA-p samples where no evidence of ctDNA was observed (no called somatic mutations, copy number changes both focal or chromosomal arm level, or structural variants).  
 ```
 mutato analyze --alt-reads=5 --alt-frac=0.0025 --min-mapq=45 \
                --min-end-dist=15 --bg-ratio=20 --germline-ratio=3 \
                --hotspots="${ref_matti}/mutation_hotspots.tsv" \
                --output-dir="../mutations/mutato_analyze/" \
                /path/to/reference/hg38.fa "/path/to/reference/sample_sheet.tsv"
+```
+The sample sheet should be formatted like the following example:
+```
+PATIENT	SAMPLE	TYPE
+Patient-001	Patient-001_cfDNA	Cancer
+Patient-001	Patient-001_WBC	WBC
+Patient-002	EnzaP-002_cfDNA  Cancer background
+Patient-002	Patient-002_WBC	WBC
 ```
