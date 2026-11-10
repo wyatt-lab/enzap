@@ -1,0 +1,891 @@
+#!/bin/env julia
+
+using Helpers, CLI, CopyNum, Printf, DelimitedFiles, Statistics
+using Serialization, BlackBoxOptim, Plot2, KernelDensity
+
+struct BackgroundModel
+	panel::Vector{UInt8}   # Panel ID (positive are valid, 0 = probe failed QC)
+	chromosome::Vector{String}
+	position::Vector{Int}
+	gc_frac::Vector{Float32}
+	control_samples::Vector{String}
+	coverage::Vector{Float32}
+	variance::Vector{Float32}   # Actually mean absolute deviation
+end
+
+struct GenomicFeature
+	chr::String
+	start::Int32
+	stop::Int32
+	name::String
+end
+
+function probes_for_panel_normalization(chr, pos, panel)
+	@assert(all(0 .<= panel .<= 2))
+	probes_a = findall(panel .== 1)
+	probes_b = findall(panel .== 2)
+
+	probe_pairs = Vector{Pair{Int64, Int64}}()
+	for a in probes_a, b in probes_b
+		if chr[a] == chr[b] && abs(pos[a] - pos[b]) <= 100e3
+			push!(probe_pairs, a => b)
+			#println(stderr, "$(chr[a]):$(pos[a]) <-> $(chr[b]):$(pos[b])")
+		end
+	end
+	return probe_pairs
+end
+
+
+function equalize_panels(logratio, probe_pairs, panel)
+	delta = median([logratio[p[2]] - logratio[p[1]] for p in probe_pairs])
+	return logratio .+ (panel .== 1) .* delta
+end
+
+# FIXME: This doesn't calculate an actual 95% confidence interval so should
+# be dropped
+function ci_gene(feature_lr)
+	adj_n = max(round(length(feature_lr) / 5), 1)
+	return std(feature_lr) * 4 / sqrt(adj_n)
+end
+
+
+function background(bed_file, controls...; output_stats="", hide_genes="", max_ref_noise=0, minimum_depth=0)
+
+	info("Generating background model based on $(length(controls)) control samples...")
+	if length(controls) < 3
+		warn("Less than 3 control samples is not optimal.")
+	end
+
+	info("Reading probe/region coordinates into memory...")
+	d = readdlm(bed_file, '\t')
+	chrom = d[:, 1]
+	position = round.(Int, mean(d[:, 2:3], dims=2)[:])
+	if size(d, 2) >= 4
+		panel = Int8.(indexin(d[:, 4], unique(d[:, 4])))
+		if maximum(panel) > 2
+			error("The fourth column of the BED file indicates > 2 panels used in the experiment. Only two-panel admixtures are currently supported.")
+		end
+	else
+		# No panel column found in the BED file, so we assume that no panel
+		# admixture was used in generating the data.
+		panel = fill(Int8(1), length(chrom))
+	end
+	panel_admixture = maximum(panel) > 1
+
+	info("Reading target GC fractions into memory...")
+	gc_frac_file = replace(bed_file, r"\.bed$", ".gc")
+	if !isfile(gc_frac_file)
+		error("Cannot find GC fraction file $gc_frac_file.")
+	end
+	gc_frac = Float64.(readdlm(gc_frac_file, '\t')[:, 3])
+	@assert(all(isfinite, gc_frac))
+	info("- Found $(length(position)) total capture regions.")
+
+	valid = quantile(gc_frac, 0.03) .< gc_frac .< quantile(gc_frac, 0.97) 
+	panel[!valid] .= 0     # Panel = 0 indicates a blacklisted region
+	@printf(stderr, "- %d (%.1f%%) regions blacklisted due to extreme GC fraction\n", sum(panel .== 0), sum(panel .== 0) / length(panel) * 100)
+
+	info("Constructing a median reference based on $(length(controls)) control samples...")
+	ref = zeros(length(position), length(controls))
+	for s in 1:length(controls)
+		ref[:, s] = readdlm("$(controls[s]).tsv", '\t')
+	end
+	ref = max.(ref, 1)    # Prevent issues with logarithm
+
+	#hide_genes = strip.(split(hide_genes, ','))
+
+	#valid = [!(g in hide_genes) for g in gene]
+	#valid_2 = median(ref, dims=2)[:] .>= 30
+	#valid_3 = quantile(gc_frac, 0.04) .< gc_frac .< quantile(gc_frac, 0.96) 
+	#valid = valid_1 & valid_2 & valid_3
+
+	#@printf(stderr, "Discarded %d / %d (%.1f%%) regions from analysis:\n",
+	#	sum(!valid), length(valid), mean(!valid) * 100)
+	#@printf(stderr, "- %d regions excluded by user\n", sum(!valid_1))
+	#@printf(stderr, "- %d with low coverage in reference samples\n", sum(!valid_2))
+	#@printf(stderr, "- %d with outlier GC fraction\n", sum(!valid_3))
+
+	#chrom = chrom[valid]; position = position[valid];
+	#gc_frac = gc_frac[valid]; gene = gene[valid];
+	#ref = ref[valid, :]
+	
+	# Calculate median coverage profile after normalizing the average coverage 
+	# of each sample to 1.
+	mean_cov = [mean(ref[:, s]) for s in 1:length(controls)]
+	median_ref = [median(ref[k, :] ./ mean_cov) for k in 1:length(chrom)]
+	@assert(all(0 .< median_ref .< Inf))
+	
+	# Discard the low depth regions
+	if minimum_depth > 0
+		@printf(stderr, "Discarding regions with less than %i median depth...\n", minimum_depth)
+		depth_ok = [median(ref[k, :]) > minimum_depth for k in 1:length(chrom)]
+		panel[!depth_ok] .= 0
+	end
+
+	# If the hybridization capture was carried out using an admixture of
+	# two panels, find a set of adjacent cross-panel probe pairs that we can
+	# use to normalize for probe concentrations in the admixture.
+	if panel_admixture
+		probe_pairs = probes_for_panel_normalization(chrom, position, panel)
+		info("Found $(length(probe_pairs)) probe pairs for cross-panel normalization.")
+	end
+
+	logratios = fill(NaN, size(ref))
+	for s in 1:length(controls)
+		# For each sample, calculate coverage logratios relative to the median
+		# coverage profile
+		lr = log2.(ref[:, s] ./ median_ref)
+
+		# If hybridization capture was carried out using an admixture of
+		# two panels, correct for systematic differences between the panels.
+		if panel_admixture
+			lr = equalize_panels(lr, probe_pairs, panel)
+		end
+
+		lr = correct_gc_bias(gc_frac, lr, chrom, position)
+			#visualize=(output_stats != "" ?
+			#"$output_stats/$(controls[s])_gc_bias.png" : ""))
+		
+		# For maximally accurate results, we run a second round of cross-panel
+		# normalization after GC bias correction.
+		if panel_admixture
+			lr = equalize_panels(lr, probe_pairs, panel)
+		end
+
+		logratios[:, s] = lr .- median(lr)
+	end
+	median_ref .*= 2 .^ median(logratios, dims=2)[:]
+
+	# Coverage logratio mean absolute deviation at each genomic region
+	probe_mean_abs_dev = [mean(abs.(logratios[k, :])) for k in 1:length(median_ref)]
+	@assert(all(isfinite, probe_mean_abs_dev))
+	println(stderr, probe_mean_abs_dev[1:20])
+	if output_stats != ""
+		bins = 0:0.001:0.5
+		hist = zeros(length(bins))
+		for n in probe_mean_abs_dev
+			hist[min(round(Int, n * 1000)+1, 501)] += 1
+		end
+		println(stderr, hist[1:20])
+		println(stderr, argmax(hist))
+		figure("$output_stats/noise_histogram.pdf") do
+			line_plot(bins, hist)
+			xlim(0, 0.5); xlabel("Coverage logratio mean absolute deviation")
+			Plot2.grid([])
+		end
+	end
+
+	serialize(stdout, BackgroundModel(panel, chrom, position, gc_frac,
+		collect(controls), median_ref, probe_mean_abs_dev))
+end
+
+
+function call(bg_profile::IO, samples...; snps_dir="../mutations", report_dir="", output_format="PDF", plot_gc_bias=false, features="", snp_median_decimate=1, snp_bin_size=1, no_mirror=false, logratio_dots=Inf, segment=0, min_hsaf_depth=100, min_mapq=20, bad_snps="", models="", max_probe_noise=Inf, mutato_old=false)
+
+	report_dir = expanduser(report_dir)
+	# hetz_snps = expanduser(snps_dir)
+	output_formats = uppercase.(split(output_format, ','))
+
+	# Allow providing sample names with a *.tsv suffix
+	samples = [replace(s, r".tsv$", "") for s in samples] 
+	
+	### This is not needed for the new version of .mut files ->
+	if mutato_old
+		info("Scanning the SNP directory...")
+		sample_mut_file = Dict{String, String}()
+		mut_files = !isdir(snps_dir) ? [] :
+			filter(f -> endswith(f, ".mut"), readdir(snps_dir, join=true))
+		for mut_file in mut_files
+			headers = split(readline(mut_file), '\t')
+			notes_col = findone(headers, "NOTES")
+			for s in headers[notes_col+1:end-1]; sample_mut_file[s] = mut_file; end
+		end
+	end
+
+	info("Reading background profile into memory...")
+	bg = deserialize(bg_profile)
+	panel = bg.panel; chrom = bg.chromosome; position = bg.position;
+	gc_frac = bg.gc_frac; median_ref = bg.coverage;
+	ok_probe = (panel .!= 0) & (bg.variance .<= max_probe_noise)
+
+	features_path = features
+	features = GenomicFeature[]
+	if features_path != ""
+		info("Reading list of highlighted genomic features into memory...")
+		d = readtsv(features_path)
+		features = [GenomicFeature(d[r, :]...) for r in 1:size(d, 1)]
+	end
+
+	panel_admixture = maximum(panel) > 1
+	if panel_admixture
+		probe_pairs = probes_for_panel_normalization(chrom, position, panel)
+		info("Found $(length(probe_pairs)) probe pairs for cross-panel normalization.")
+	end
+
+	# Read copy number models (cancer fraction + diploid level) into memory
+	if models == "" || !isfile(models)
+		cn_models = Dict{String, Tuple{Float64, Float64}}()
+	else
+		cn_models = Dict(String(r[1]) => (Float64(r[2]) / 100, r[3] == "" ? 0 : Float64(r[3])) for r in eachrow(readtsv(models))
+			if r[2] isa Number)
+	end
+
+	# Read a list of blacklisted SNPs to memory
+	blacklisted_snps = Set{String}()
+	if !isempty(bad_snps)
+		d = readtsv(bad_snps)
+		blacklisted_snps = Set(["$(r[1]):$(r[2])" for r in eachrow(d)])
+	end
+
+	# Decimate logratios to a user-defined number of points
+	fold = max(ceil(Int, length(median_ref) / logratio_dots), 1)
+	info("Logratios are median-decimated $fold-fold for visualization.")
+
+	# Calculate chromosome start coordinates for genome plots
+	d = readdlm(expanduser("/groups/wyattgrp/users/jbacon/reference/matti_hg38/hg38.chrom.sizes"))
+	chr_names = d[:, 1]
+	chr_lens = Int32.(d[:, 2])
+	chr_start = Dict(chr_names[c] => sum(chr_lens[1:c-1])
+		for c in 1:length(chr_names))
+	chr_order = Dict(chr_names[c] => c for c in 1:length(chr_names))
+	genome_len = sum(chr_lens)
+
+	# Calculate genome coordinates for genes of interest, and sort them
+	feature_gpos = [chr_start[f.chr] + (f.start + f.stop) / 2 for f in features]
+	order = sortperm(feature_gpos)
+	features = features[order]
+	feature_gpos = feature_gpos[order]
+
+	# Discard features that have no associated probes
+	feature_probes = [Int[] for f in 1:length(features)]
+	coalesced_probes = falses(length(position))
+	for f in 1:length(features)
+		inside = findall(k -> chrom[k] == features[f].chr && features[f].start <= position[k] <= features[f].stop, 1:length(chrom))
+		feature_probes[f] = inside
+		coalesced_probes[inside] .= true
+	end
+	keep = BitVector([!isempty(feature_probes[f]) for f in 1:length(features)])
+	for f in findall(!keep)
+		info("Feature $(features[f].name) has no associated probes.")
+	end
+	features = features[keep]
+	feature_gpos = feature_gpos[keep]
+	feature_probes = feature_probes[keep]
+
+	noise_levels = Dict{String, Float64}()
+
+	# Calculate figure coordinates for the shaded polygons that indicate
+	# chromosomes and connect the top and bottom halves of the figure.
+	chr_polygons = []
+	for c in 2:2:length(chr_lens)
+		# Chromosome start
+		start_top_x = 0.055 + sum(chr_lens[1:c-1], init=0) / genome_len * 0.94
+		after = findlast(f -> chr_order[f.chr] < c, features)
+		after = (after == nothing) ? 0 : after
+		start_bottom_x = 0.055 + after / length(features) * 0.94
+
+		# Chromosome end
+		end_top_x = 0.055 + sum(chr_lens[1:c]) / genome_len * 0.94
+		after = findlast(f -> chr_order[f.chr] <= c, features)
+		after = (after == nothing) ? 0 : after
+		end_bottom_x = 0.055 + after / length(features) * 0.94
+
+		# Prevent the shaded region from collapsing if the chromosome has
+		# no features in the bottom panel
+		if start_bottom_x == end_bottom_x
+			start_bottom_x -= 1 / length(features) / 20
+			end_bottom_x += 1 / length(features) / 20
+		end
+
+		push!(chr_polygons, [start_bottom_x 0.07; start_bottom_x 0.52;
+			start_top_x 0.54; start_top_x 0.99; end_top_x 0.99; end_top_x 0.54;
+			end_bottom_x 0.52; end_bottom_x 0.07
+		])
+	end
+
+	for sample in samples
+		info("Analyzing $sample:")
+		coverage = Float32.(readdlm("$sample.tsv"))[:, 1]
+		coverage = max.(coverage, 1)   # Avoid -Inf logratios
+
+		# Coverage logratio track
+		lr = log2.(coverage ./ median_ref)
+		@assert(!any(isnan, lr))
+
+		# If hybridization capture was carried out using an admixture of
+		# two panels, correct for systematic differences between the panels.
+		if panel_admixture
+			lr = equalize_panels(lr, probe_pairs, panel)
+		end
+
+		# Correct GC bias and set median to zero
+		lr .-= median(lr)
+		lr = correct_gc_bias(gc_frac, lr, chrom, position;
+			visualize=plot_gc_bias ? "$report_dir/$(sample)_gc_bias.png" : "")
+		lr .-= median(lr)
+
+		# For maximally accurate results, we run a second round of cross-panel
+		# normalization after GC bias correction.
+		if panel_admixture
+			lr = equalize_panels(lr, probe_pairs, panel)
+		end
+
+		# Calculate noise level
+		delta = zeros(0)
+		for k in 1:length(lr)-1
+			if !(ok_probe[k] && ok_probe[k + 1]); continue; end
+			if chrom[k] == chrom[k+1] && abs(position[k] - position[k+1]) < 500e3
+				push!(delta, abs(lr[k] - lr[k+1]))
+			end
+		end
+		noise_levels[sample] = median(delta)
+
+		# Perform segmentation on the coverage logratios
+		if segment > 0
+			segments = CopyNum.segment(chrom[ok_probe], position[ok_probe],
+				lr[ok_probe]; threshold=segment)[:, 1]
+			info("- Found $(length(segments)) segments.")
+		else
+			segments = Segment[]
+		end
+
+		# Calculate heterozygous SNP allele fractions
+		snp_chr = String[]; snp_pos = Int[]; snp_af = Float32[];
+		snp_depth = Int[];
+
+		### Old version of .mut files ->
+		if mutato_old
+			if haskey(sample_mut_file, sample)
+				d = readtsv(sample_mut_file[sample])
+				headers = d[1, :]
+				notes_col = findone(headers, "NOTES")
+				wbc = findall(h -> r"WBC|gDNA" in h, headers)
+				s = findone(headers, sample)
+				for r in 2:size(d, 1)
+					# TODO: For female patients allow hetz SNPs in chrX
+					if !(d[r, 1] in chr_names); continue; end
+					if r"X|Y" in d[r, 1]; continue; end
+					if length(d[r, 3]) != 1 || length(d[r, 4]) != 1; continue; end
+					# if !("GNOMAD" in d[r, notes_col]); continue; end
+					if "$(d[r, 1]):$(d[r, 2])" in blacklisted_snps; continue; end
+	
+					cols = split(d[r, s], ':')
+					mapq = parse(Int, cols[3])
+					if mapq < min_mapq; continue; end
+					alt = parse(Int, cols[1]); total = parse(Int, cols[2])
+					if total < min_hsaf_depth; continue; end
+					maf = alt / total
+	
+					# Check that the WBC allele fraction looks heterozygous
+					wbc_alt = 0; wbc_total = 0
+					if !isempty(wbc)
+						for w in wbc
+							cols = split(d[r, w], ':')
+							wbc_alt += parse(Int, cols[1])
+							wbc_total += parse(Int, cols[2])
+						end
+					end
+					if wbc_total >= 10
+						if !(0.3 <= wbc_alt / wbc_total <= 0.7); continue; end
+					else
+						# If there is no matched germline info, we use a heuristic
+						if !(0.05 <= maf <= 0.95); continue; end
+					end
+	
+					push!(snp_chr, d[r, 1])
+					push!(snp_pos, d[r, 2])
+					push!(snp_af, maf)
+					push!(snp_depth, total)
+				end
+				info("- Identified $(length(snp_af)) heterozygous SNPs.")
+			else
+				info("- WARNING: No SNP info found for sample.")
+			end
+		else ### New version of .mut files -> 
+			if isfile("$snps_dir/$sample.mut")
+				d = readtsv("$snps_dir/$sample.mut")
+				headers = d[1, :]
+				germline_col = findone(headers, "GERMLINE")
+				somatic_col = findone(headers, "SOMATIC")
+				mapq_col = findone(headers, "MAPQ")
+
+				for r in 2:size(d, 1)
+					# TODO: For female patients allow hetz SNPs in chrX
+					if !(d[r, 1] in chr_names); continue; end
+					if r"X|Y" in d[r, 1]; continue; end
+					if length(d[r, 3]) != 1 || length(d[r, 4]) != 1; continue; end
+					if (d[r, 3] == "N") || (d[r, 4] == "N"); continue; end
+					# if !("GNOMAD" in d[r, notes_col]); continue; end
+					if "$(d[r, 1]):$(d[r, 2])" in blacklisted_snps; continue; end
+
+					mapq = d[r, mapq_col]
+					if mapq == "" || mapq < min_mapq; continue; end
+					cols = split(d[r, somatic_col], ' ')
+					alt = parse(Int, cols[1])
+					total = parse(Int, cols[3])
+					if total < min_hsaf_depth; continue; end
+					maf = alt / total
+
+					# Check that the WBC allele fraction looks heterozygous
+					cols = split(d[r, germline_col], ' ')
+					wbc_alt = parse(Int, cols[1])
+					wbc_total = parse(Int, cols[3])
+					if wbc_total >= 10 && 0.4 <= wbc_alt / wbc_total <= 0.6
+						push!(snp_chr, d[r, 1])
+						push!(snp_pos, d[r, 2])
+						push!(snp_af, abs(maf - 0.5) + 0.5)
+						push!(snp_depth, total)
+					end
+				end
+				info("- Identified $(length(snp_af)) heterozygous SNPs.")
+			else
+				info("- WARNING: No SNP info found for sample.")
+			end
+		end
+
+		snp_af = no_mirror ? snp_af : abs.(snp_af .- 0.5) .+ 0.5
+
+		if length(snp_af) > 0
+			if snp_median_decimate > 1
+				info("- Median decimating SNPs $snp_median_decimate-fold.")
+				_, _, snp_depth = median_decimate(snp_chr, snp_pos, snp_depth,
+					snp_median_decimate)
+				snp_chr, snp_pos, snp_af = median_decimate(
+					snp_chr, snp_pos, snp_af, snp_median_decimate)
+			elseif snp_bin_size > 1
+				info("- Grouping SNPs to $(snp_bin_size)KB bins.")
+				_, _, snp_depth = positional_median_decimate(snp_chr, snp_pos, snp_depth,
+					snp_bin_size*1000)
+				
+				snp_chr, snp_pos, snp_af = positional_median_decimate(
+					snp_chr, snp_pos, snp_af, snp_bin_size*1000)
+				valid = isfinite.(snp_af)
+				snp_chr, snp_pos, snp_af, snp_depth = snp_chr[valid], snp_pos[valid], snp_af[valid], snp_depth[valid]
+			end
+		end
+
+		# Calculate median HSAF values for segments
+		for seg in segments
+			valid = [snp_chr[k] == seg.chromosome && seg.start <= snp_pos[k] <= seg.stop && isfinite(snp_af[k]) for k in 1:length(snp_af)]
+			valid_af = 0.5 .+ abs.(0.5 .- snp_af[valid])
+			seg.hsaf = isempty(valid_af) ? NaN : median(valid_af)
+			seg.hsaf_stdev = isempty(valid_af) ? NaN : std(valid_af)
+			seg.depth = isempty(valid_af) ? NaN : median(snp_depth[valid])
+		end
+
+		# Coalesce coverage logratios within features
+		feature_lr = [lr[feature_probes[f]] for f in 1:length(features)]
+
+		# Coalesce heterozygous SNPs within features
+		coalesced_snps = falses(length(snp_chr))
+		feature_hsaf = [zeros(0) for f in 1:length(features)]
+		for f in 1:length(features)
+			inside = findall(k -> snp_chr[k] == features[f].chr &&
+				features[f].start <= snp_pos[k] <= features[f].stop,
+				1:length(snp_chr))
+			feature_hsaf[f] = snp_af[inside]
+			coalesced_snps[inside] .= true
+		end
+
+		# Median-decimate the logratios for visualization
+		valid = ok_probe & !coalesced_probes
+		decimated_chr, decimated_pos, decimated_lr = median_decimate(
+			chrom[valid], position[valid], lr[valid], fold)
+
+		# Calculate an optimal y-axis range
+		if length(decimated_lr) > 0
+			ymin = quantile(decimated_lr, 0.01)
+			ymax = quantile(decimated_lr, 0.99)
+		else
+			ymax = 2
+			ymin = -2
+			for i in feature_lr
+				if quantile(i, 0.95) > ymax
+					ymax = quantile(i, 0.95)
+				elseif quantile(i, 0.05) > ymin
+					ymin = quantile(i, 0.05)
+				end
+			end
+		end
+		ymin -= (ymax - ymin) / 10
+		ymax += (ymax - ymin) / 10
+		ymin = min(ymin, -2)
+		ymax = max(ymax, 2)
+
+		for of in output_formats
+			if of == "IGV"
+				write_igv("$report_dir/$(sample)_logratio.igv", [sample],
+					chrom[ok_probe], position[ok_probe], lr[ok_probe])
+
+				if length(snp_af) > 0
+					out = open("$report_dir/$(sample)_hetz_snp.tsv", "w")
+					@printf(out, "CHROM\tPOSITION\tALT_FRAC\tDEPTH\n")
+					for k in 1:length(snp_af)
+						@printf(out, "%s\t%d\t%.5f\t%d\n", snp_chr[k], snp_pos[k],
+							snp_af[k], snp_depth[k])
+					end
+					close(out)
+				end
+
+				if segment > 0
+					out = open("$report_dir/$(sample)_segments.tsv", "w")
+					println(out, "CHROM\tSTART\tSTOP\tLOGRATIO\tLOGRATIO_VARIANCE\tHSAF\tHSAF_STDEV\tMEDIAN_DEPTH")
+					for seg in segments
+						@printf(out, "%s\t%d\t%d\t%.5f\t%.5f\t%.5f\t%.5f\t%d\n",
+							seg.chromosome, seg.start, seg.stop,
+							seg.logratio, seg.logratio_var,
+							seg.hsaf, seg.hsaf_stdev, seg.depth)
+					end
+					close(out)
+				end
+
+			elseif of in ["PDF", "PNG"]
+				figure("$report_dir/$sample.$(lowercase(of))", size=(12, 10)) do
+
+					# DRAW SHADED POLYGONS INDICATING CHROMOSOME BOUNDARIES
+					for polygon in chr_polygons
+						PyPlot.gcf().add_artist(Matplotlib.patches.Polygon(polygon; facecolor=hex(RGB(246)), zorder=-1000))
+					end
+
+					# GENOME-WIDE SEGMENTED COVERAGE LOGRATIO VISUALIZATION
+					PyPlot.axes((0.055, 0.66, 0.94, 0.33))
+					line_plot([0.5, length(features) + 0.5], [0, 0])
+
+					# Visualize the genome-wide logratios
+					gpos = [chr_start[decimated_chr[k]] + decimated_pos[k]
+						for k in 1:length(decimated_chr)]
+					scatter_plot(gpos, decimated_lr; color=RGB(160))
+
+					# Visualize the feature logratios
+					scatter_plot(feature_gpos, median.(feature_lr);
+						color=[cn_color(median(f)) for f in feature_lr], size=20)
+
+					# Visualize the CN segments
+					for seg in segments
+						start = chr_start[seg.chromosome] + seg.start
+						stop = chr_start[seg.chromosome] + seg.stop
+						line_plot([start, stop], fill(seg.logratio, 2),
+							color=RGB(0), line_width=1.5)
+					end
+
+					# Overlay a copy number model (if one is available)
+					if haskey(cn_models, sample)
+						cf, diploid_level = cn_models[sample]
+						chr22_end = 2875001522	# For hg38
+						for cn in 0:4
+							level = cn_to_logratio(cn, cf, 2) + diploid_level 
+							line_plot([1, chr22_end], fill(level, 2),
+								color=cna_colors[cn + 1])
+						end
+					end
+
+					xlim(0, sum(chr_lens))
+					ylabel("Coverage logratio")
+					ylim(ymin, ymax)
+					xticks([])
+					PyPlot.grid(false, axis="y", which="both")
+
+
+					# GENOME-WIDE HETEROZYGOUS SNPS VISUALIZATION
+					PyPlot.axes((0.055, 0.56, 0.94, 0.098))
+					
+					gpos = [chr_start[snp_chr[k]] + snp_pos[k]
+						for k in 1:length(snp_chr)]
+					scatter_plot(gpos[!coalesced_snps], snp_af[!coalesced_snps];
+						color=RGB(160))
+
+					valid = !isempty.(feature_hsaf);
+					scatter_plot(feature_gpos[valid], median.(feature_hsaf[valid]);
+						color=[cn_color(median(f)) for f in feature_lr[valid]], size=20)
+
+					for seg in segments
+						start = chr_start[seg.chromosome] + seg.start
+						stop = chr_start[seg.chromosome] + seg.stop
+						line_plot([start, stop], fill(seg.hsaf, 2),
+							color=RGB(0), line_width=1.5)
+					end
+
+					# Overlay a copy number model (if one is available)
+					if haskey(cn_models, sample)
+						cf, diploid_level = cn_models[sample]
+						chr22_end = 2875001522	# For hg38
+						line_plot([0, chr22_end], fill((cf + 1) / 2, 2),
+							color=RGB(255, 80, 255))     # cnLOH
+						line_plot([0, chr22_end], fill(1 / (2 - cf), 2),
+							color=RGB(120, 120, 255))    # Monoallelic loss
+						line_plot([0, chr22_end], fill((cf + 1) / (cf + 2), 2),
+							color=RGB(255, 120, 120))    # Single copy gain
+					end
+
+					ylabel("Hetz SNP AF")
+					xlim(0, sum(chr_lens))
+					ylim(no_mirror ? 0 : 0.5, 1)
+					xticks([])
+					yticks([0.5, 0.6, 0.7, 0.8, 0.9])
+					for c in 1:24
+						text(sum(chr_lens[1:c-1]) + chr_lens[c] / 2,
+							(no_mirror ? 0 : 0.5) - 0.01,
+							replace(chr_names[c], "chr", ""),
+							size=10, v_align="top")
+					end
+					PyPlot.grid(false, axis="y", which="both")
+
+
+					if length(features) == 0; return; end
+
+					# COVERAGE LOGRATIO VIOLIN PLOT
+					PyPlot.axes((0.055, 0.17, 0.94, 0.33))
+					
+					grid = -10:0.05:10
+					density = zeros(length(grid), length(features))
+					for f in 1:length(features)
+						lr = filter(isfinite, feature_lr[f])
+						density[:, f] = kde(lr, grid).density
+					end
+
+					visible = (ymin .<= grid .<= ymax)
+					violin_plot(grid[visible], density[visible, :],
+						color=[cn_color(median(f)) for f in feature_lr])
+
+					for run in runs([f.chr for f in features])
+						text((run[1] + run[end]) / 2, ymax,
+							replace(features[run[1]].chr, "chr", "");
+							size=10, v_align="bottom")
+					end
+					text(length(features) / 2, ymax + (ymax - ymin) / 10,
+						"Chromosome", size=10)
+
+					# Copy number model overlay if model is provided
+					if haskey(cn_models, sample)
+						cf, diploid_level = cn_models[sample]
+						chr22_end = 2875001522	# For hg38
+						for cn in 0:4
+							level = cn_to_logratio(cn, cf, 2) + diploid_level 
+							line_plot([1, chr22_end], fill(level, 2),
+								color=cna_colors[cn + 1], style="--", line_width=0.1)
+						end
+					end
+
+					line_plot([0.25, length(features) + 0.5], [0, 0];
+						color=RGB(220), style="--")
+					xlim(0.5, length(features) + 0.5)
+					ylim(ymin, ymax)
+					xticks([])
+					PyPlot.grid(false, axis="x", which="both")
+					PyPlot.grid(false, axis="y", which="both")
+					ylabel("Coverage logratio")
+
+
+
+					# HETEROZYGOUS SNPS BEESWARM PLOT
+					PyPlot.axes((0.055, 0.07, 0.94, 0.098))
+					beeswarm_plot(feature_hsaf...)
+					xlim(0.5, length(features) + 0.5)
+					ylim(0.5, 1)
+					yticks([0.5, 0.6, 0.7, 0.8, 0.9])
+					xticks([f.name for f in features])
+					ylabel("Hetz SNP AF")
+
+					# Overlay a copy number model (if one is available)
+					if haskey(cn_models, sample)
+						cf, diploid_level = cn_models[sample]
+						chr22_end = 2875001522	# For hg38
+						line_plot([0, chr22_end], fill((cf + 1) / 2, 2),
+							color=RGB(255, 80, 255))     # cnLOH
+						line_plot([0, chr22_end], fill(1 / (2 - cf), 2),
+							color=RGB(120, 120, 255))    # Monoallelic loss
+						line_plot([0, chr22_end], fill((cf + 1) / (cf + 2), 2),
+							color=RGB(255, 120, 120))    # Single copy gain
+					end
+
+					PyPlot.grid(false, axis="y", which="both")
+					PyPlot.grid(false, axis="x", which="both")
+				end
+			elseif of == "TSV"
+				for f in 1:length(features)
+					@printf("%s\t%s\t%.3f\t%.3f\t%.3f\n", sample, features[f].name,
+						median(feature_lr[f]),
+						isempty(feature_hsaf[f]) ? NaN : median(feature_hsaf[f]),
+						ci_gene(feature_lr[f]))
+				end
+			else
+				error("Unknown output format \"$of\" requested.")
+			end
+		end
+	end
+
+	# Write sample noise levels to the output directory
+	out = open("$report_dir/sample_noise_levels.tsv", "w")
+	for sample in sort(collect(keys(noise_levels)))
+		@printf(out, "%s\t%.3f\n", sample, noise_levels[sample])
+	end
+	close(out)
+end
+
+const cna_colors = [RGB(0,0,255), RGB(120,120,255), RGB(0,0,0), RGB(255,120,120), RGB(255,0,0)]
+
+function cn_color(lr)
+	#maf = cn.median_af[g, s]
+	#if lr <= -0.15 && maf >= 0.6; return -1; end
+	call = 0
+	if lr <= -0.3; call = -1; end
+	if lr <= -1.0; call = -2; end
+	#if lr >= 0.15 && maf >= 0.6; return 1; end
+	if lr >= 0.3; call = 1; end
+	if lr >= 0.7; call = 2; end
+	return cna_colors[call + 3]
+end
+
+function figure_line(x, y; color=RGB(0), linestyle="--", linewidth=0.8)
+	PyPlot.gcf().add_artist(Matplotlib.lines.Line2D(x, y; color=hex(color), linestyle=linestyle, linewidth=linewidth))
+end
+
+
+function create_chromosome_grid(chr_names, chr_lens)
+	PyPlot.grid(true, axis="x", which="major", linestyle="dashed")
+	PyPlot.grid(false, axis="y", which="both")   # No x-axis grid
+	PyPlot.tick_params(axis="x", which="both", length=0)
+	PyPlot.gca().set_xticks(cumsum(chr_lens))
+	PyPlot.gca().set_xticklabels([])
+	PyPlot.gca().set_xticks(cumsum(chr_lens) .- chr_lens ./ 2, minor=true)
+	PyPlot.gca().set_xticklabels(
+		[r"M" in chr ? "" : replace(chr, "chr", "") for chr in chr_names],
+		minor=true)
+end
+
+
+
+
+function segment(patient; threshold=0.5, logratio_decimation=51)
+	regex = Regex("^$patient[-_].+_logratio.igv\$")
+	samples = [replace(s, "_logratio.igv", "") for s in readdir() if regex in s]
+
+	println(stderr, "Initiating analysis for samples:")
+	for s in samples; println(stderr, "- $s"); end
+
+	println(stderr, "Reading logratio tracks into memory...")
+	chromosome, position, lr = median_decimate(read_igv("$(samples[1])_logratio.igv")..., logratio_decimation)
+
+	logratio = fill(Float32(NaN), length(chromosome), length(samples))
+	logratio[:, 1] .= lr
+	for s in 2:length(samples)
+		_, _, lr = median_decimate(read_igv("$(samples[s])_logratio.igv")..., logratio_decimation)
+		logratio[:, s] .= lr
+	end
+
+	println(stderr, "Estimating sample noise level...")
+	noise_level = [median(abs.(diff(logratio[:, s]))) for s in 1:length(samples)]
+	for s in 1:length(samples)
+		@printf("- %s: %.3f\n", samples[s], noise_level[s])
+	end
+
+	println(stderr, "Performing multi-sample segmentation...")
+	segments = CopyNum.segment(chromosome, position, logratio; threshold=threshold)
+	println(stderr, "Found $(size(segments, 1)) segments.")
+
+	println(stderr, "Calculating hetz SNP allele fractions...")
+	for s in 1:length(samples)
+		# Read hetz SNP allele fractions into memory
+		d = readtsv("$(samples[s])_hetz_snp.tsv")
+		snp_chromosome = String.(d[2:end, 1])
+		snp_position = Int.(d[2:end, 2])
+		snp_af = Float32.(d[2:end, 3])
+		snp_depth = Float32.(d[2:end, 4])
+
+		for seg in segments[:, s]
+			valid = [snp_chromosome[k] == seg.chromosome &&
+				seg.start <= snp_position[k] <= seg.stop &&
+				isfinite(snp_af[k]) for k in 1:length(snp_af)]
+			valid_af = 0.5 .+ abs.(0.5 .- snp_af[valid])
+			seg.hsaf = isempty(valid_af) ? NaN : median(valid_af)
+			seg.hsaf_stdev = isempty(valid_af) ? NaN : std(valid_af)
+			seg.depth = isempty(valid_af) ? NaN : median(snp_depth[valid])
+		end
+	end
+
+	println(stderr, "Writing results into TSV file...")
+	for s in 1:length(samples)
+		out = open("$(samples[s])_segments.tsv", "w")
+		println(out, "CHR\tSTART\tEND\tLOGRATIO\tLOGRATIO_VAR\tHSAF\tHSAF_STDEV\tMEDIAN_DEPTH")
+		for seg in segments[:, s]
+			@printf(out, "%s\t%d\t%d", seg.chromosome, seg.start, seg.stop)
+			@printf(out, "\t%.4f\t%.4f", seg.logratio, seg.logratio_var)
+			@printf(out, "\t%.4f\t%.4f", seg.hsaf, seg.hsaf_stdev)
+			@printf(out, "\t%d\n", seg.depth)
+		end
+		close(out)
+	end
+end
+
+
+function grid(genome_path::IO, win_size::Int; step=0)
+	if step == 0; step = round(Int, win_size / 2); end
+	for line in eachline(genome_path)
+		c = split(line, '\t')
+		if length(c) < 2; continue; end
+		chr = c[1]
+		chr_len = parse(Int, c[2])
+		start = 1
+		while start + win_size < chr_len
+			println("$(chr)\t$(start-1)\t$(start + win_size - 1)")
+			start += step
+		end
+	end
+end
+
+
+
+######################
+# GC bias correction #
+######################
+
+poly(x, c) = c[1] * x + c[2] * x^2 + c[3] * x^3 + c[4]
+
+function correct_gc_bias(gc_frac, lr, chromosome, position; visualize="")
+	@assert(all(0 .<= gc_frac .<= 1))
+
+	# TODO: Assert that probes are sorted by chromosome position
+	#x1 = zeros(0); x2 = zeros(0); y = zeros(0)
+	#for k in 1:length(chromosome)
+	#	for j in k+1:min(k+5, length(chromosome))
+	#		if chromosome[k] != chromosome[j]; break; end
+	#		if abs(position[k] - position[j]) > 100e3; break; end
+	#		if abs(gc_frac[k] - gc_frac[j]) < 0.1; continue; end
+	#		push!(x1, gc_frac[k])
+	#		push!(x2, gc_frac[j])
+	#		push!(y, lr[j] - lr[k])
+	#	end
+	#end
+
+	# Never use more than 10,000 data values for GC bias detection
+	valid = length(lr) > 10_000 ? 
+		valid = round.(Int, collect(range(1, length(lr), length=10_000))) :
+		1:length(lr)
+
+	#error(factors) = sum(
+	#	[abs(y[k] - (poly(x2[k], factors) - poly(x1[k], factors)))
+	#	for k in 1:length(y)])   # Fit using adjacent deltas only
+	error(factors) = sum([abs(lr[k] - poly(gc_frac[k], factors)) for k in valid])
+
+	# Fit 3rd degree polynomial to the data, minimizing error
+	res = bboptimize(error, SearchRange=(-1000.0, 1000.0), NumDimensions=4, Method=:de_rand_1_bin, TraceMode=:silent)
+	factors = best_candidate(res)
+	#@printf(stderr, "Best solution: %.2fx^3 + %.2fx^2 + %.2fx + %.2f\n", factors[3], factors[2], factors[1], factors[4])
+
+	# Visualize the GC bias
+	if visualize != ""
+		gc_grid = minimum(gc_frac):0.01:maximum(gc_frac)
+		gc_curve = [poly(g, factors) for g in gc_grid]
+
+		figure(visualize, size=[6, 4]) do
+			scatter_plot(gc_frac, lr)
+			line_plot(gc_grid, gc_curve)
+			#line_plot(gc_grid, gc_curve .- (median(gc_curve) - median(lr)))
+			xlabel("GC fraction"); ylabel("Coverage logratio")
+		end
+	end
+
+	return lr .- [poly(g, factors) for g in gc_frac]
+end
+
+subcommands(grid, background, call)
