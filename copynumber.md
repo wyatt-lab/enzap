@@ -36,6 +36,8 @@ An example line in the cn_features.bed file (do not include headers in file):
 chr1	26696003	26780786	ARID1A
 ```
 
+Then, in julia, run the tool for copy number model fitting from the /project/logratio_tracks folder. 
+
 
 
 
