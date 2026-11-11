@@ -44,11 +44,11 @@ Patient-002	Patient-002_WBC	WBC
 ```
 
 The mutations can then be annotated with mutato_analyze_tools annotate, inputting GNOMAD, COSMIC, and ClinVar database files. The tool is included here in the julia folder.  
-Then, somatic and germline mutations are called separately.
-'''
+Then, somatic and germline mutations are called separately.  
+```
 mutato_analyze_tools somatic --protein_altering=false --ox-filter=false --min-germline-reads=20 > "mutato_analuze_somatic_include_noncoding.tsv"
 mutato_analyze_tools germline defects --min-germline-reads=50 > "mutato_analyze_germline.tsv"
-'''
+```
 The output is then further filtered and annotated as described in the publication, using custom python scripts.   
 
 The two sets of mutations from Vardict and R are intersected to identify mutations called by both, and those are manually curated (facilitated with IGV screenshots) to remove artefact and putative variants derived from clonal hematopoiesis.
