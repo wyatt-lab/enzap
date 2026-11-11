@@ -44,6 +44,8 @@ truncal_model("sample_name", interactive=true, adjust_depth=0.567, vcf_path="-")
 An interactive window will load, with genome-wide probs and lines indicating ploidy levels. The pre-calculated ctDNA% and diploid line can be adjusted until the model best fits the observed data.
 
 2) Focal copy number analyses
+This was performed by plotting logratio and B allele frequency per probe across the gene, overlaying annotation of exon locations and ploidy lines derived from step 1. Focal copy number changes are visually identified from these plots. The logratio tracks from patient-matched WBC are plotted below the cfDNA track, to ensure that we do not misinterpret germline copy number differences as somatic.
+
 
 
 
