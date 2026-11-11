@@ -22,8 +22,13 @@ Pkg.add(split("Printf Random StatsBase DelimitedFiles Statistics Distributions C
 7. Install ANNOVAR: https://annovar.openbioinformatics.org/en/latest/user-guide/download/
 8. Install VarDictJava, GRIDSS, and GRIPSS in your conda environment
 
-Alignment steps can be found in the alignment file included here.
-Mutation analyses, copy number, and structural rearrangement analyses are likewise included. 
+## Analyses
+Markdown files are included here describing each step of analysis. 
+1) Alignment
+2) Mutations
+3) Copy number
+4) Structural variants
+
 
 
 
