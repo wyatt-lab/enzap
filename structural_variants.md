@@ -1,6 +1,6 @@
 # Structural variants 
 
-Structural variants (SVs) were detected with two different callers, GRIDSS and Breakfast (https://github.com/annalam/breakfast). All SVs called by either tool were manually inspected to remove artefacts and assess pathogenicity as described in the publication.  
+Structural variants (SVs) were detected with two different callers, GRIDSS and Breakfast (https://github.com/annalam/breakfast). All SVs called by either tool were manually inspected using IGV to remove artefacts and assess pathogenicity as described in the publication. 
 
 ## Breakfast
 
@@ -22,3 +22,8 @@ breakfast annotate sample.sv /groups/wyattgrp/users/jbacon/reference/matti_hg38/
 GRIDSS and GRIPSS were run with parameters as described in Methods.
 
 AR variants were additionally scrutinized to identify the ligand-binding domain truncating structural variants. 
+
+
+
+
+
