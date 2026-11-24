@@ -2,7 +2,7 @@
 
 This repository contains the custom code used to analyse copy number profiles, somatic variants, and structural variants in the paper "Circulating tumour DNA fraction and androgen receptor genotype predict benefit for addition of 177Lu-PSMA-617 to enzalutamide in advanced prostate cancer in the ENZA-p trial". 
 
-Access to patient sequencing data in the EnzaP trial is restricted but may be shared upon request (see Data Availability section of paper).
+Access to patient sequencing data in the EnzaP trial is restricted but may be shared upon request (see Data Availability section of paper). Example data can be accessed here: https://figshare.com/s/94960d43a6027f8e9475
 
 ## Pre-requisites
 Our analysis software and scripts are written using the Julia and Rust programming languages. To use our code, you will first need to:
